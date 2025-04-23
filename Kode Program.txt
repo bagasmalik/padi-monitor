@@ -1,0 +1,285 @@
+ort time
+import smbus
+import adafruit_dht
+import board
+import telepot
+from threading import Thread, Lock
+from ultralytics import YOLO
+import cv2
+import RPi.GPIO as GPIO
+
+# Telegram bot token and chat ID
+TOKEN = '6560716941:AAHqtbpWDkYkXbejOmJ8EPs7cPXDoUq4hgM'
+CHAT_ID = '5777263068'
+
+# File paths
+model_path = '/home/inkubator/Downloads/best(new)(1).pt'
+image_path = '/home/inkubator/Downloads/captured_image.jpg'
+annotated_image_path = '/home/inkubator/Downloads/annotated_image.jpg'
+
+# Initialize the DHT22 sensor
+dht_device = adafruit_dht.DHT22(board.D4, use_pulseio=False)
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+relay_pompa = 27
+relay_lampu = 22
+GPIO.setup(relay_pompa, GPIO.OUT)
+GPIO.setup(relay_lampu, GPIO.OUT)
+
+# Initialize relays to be off
+GPIO.output(relay_pompa, GPIO.HIGH)  # Turn off the pump
+GPIO.output(relay_lampu, GPIO.HIGH)  # Turn off the lamp
+
+# I2C address of the LCD
+LCD_ADDR = 0x27
+
+# LCD command and data flags
+LCD_CHR = 1  # Sending data
+LCD_CMD = 0  # Sending command
+
+# LCD RAM addresses for lines
+LCD_LINE_1 = 0x80  # RAM address for the 1st line
+LCD_LINE_2 = 0xC0  # RAM address for the 2nd line
+LCD_LINE_3 = 0x94  # RAM address for the 3rd line
+LCD_LINE_4 = 0xD4  # RAM address for the 4th line
+
+# LCD backlight control
+LCD_BACKLIGHT = 0x08  # On
+
+# Enable bit
+ENABLE = 0b00000100  # Enable bit
+
+# Timing constants
+E_PULSE = 0.0005
+E_DELAY = 0.0005
+
+# Initialize I2C bus
+bus = smbus.SMBus(1)
+
+# Locks for thread safety
+gpio_lock = Lock()
+camera_lock = Lock()
+
+# Function to initialize the LCD
+def lcd_init():
+    """Initialize the LCD."""
+    lcd_byte(0x33, LCD_CMD)  # 110011 Initialize
+    lcd_byte(0x32, LCD_CMD)  # 110010 Initialize
+    lcd_byte(0x06, LCD_CMD)  # 000110 Cursor move direction
+    lcd_byte(0x0C, LCD_CMD)  # 001100 Display On, Cursor Off, Blink Off
+    lcd_byte(0x28, LCD_CMD)  # 101000 Data length, number of lines, font size
+    lcd_byte(0x01, LCD_CMD)  # 000001 Clear display
+    time.sleep(E_DELAY)
+
+# Function to send byte to LCD
+def lcd_byte(bits, mode):
+    """Send byte to data pins.
+   
+    bits = data
+    mode = 1 for data
+           0 for command
+    """
+    bits_high = mode | (bits & 0xF0) | LCD_BACKLIGHT
+    bits_low = mode | ((bits << 4) & 0xF0) | LCD_BACKLIGHT
+
+    # Send high bits
+    bus.write_byte(LCD_ADDR, bits_high)
+    lcd_toggle_enable(bits_high)
+
+    # Send low bits
+    bus.write_byte(LCD_ADDR, bits_low)
+    lcd_toggle_enable(bits_low)
+
+# Function to toggle enable pin on the LCD
+def lcd_toggle_enable(bits):
+    """Toggle enable pin on the LCD."""
+    time.sleep(E_DELAY)
+    bus.write_byte(LCD_ADDR, (bits | ENABLE))
+    time.sleep(E_PULSE)
+    bus.write_byte(LCD_ADDR, (bits & ~ENABLE))
+    time.sleep(E_DELAY)
+
+# Function to send string to display on the LCD
+def lcd_string(message, line):
+    """Send string to display on the LCD."""
+    message = message.ljust(20, " ")
+
+    lcd_byte(line, LCD_CMD)
+
+    for char in message:
+        lcd_byte(ord(char), LCD_CHR)
+
+# Function to capture an image from the webcam
+def capture_image():
+    with camera_lock:
+        cap = cv2.VideoCapture(0)  # Use the first detected camera
+        if not cap.isOpened():
+            print("Error: Cannot access the camera.")
+            return False
+
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            cv2.imwrite(image_path, frame)
+            print("Image saved successfully.")
+            return True
+        else:
+            print("Error: Failed to capture the image.")
+            return False
+
+# Function to perform image detection
+def detect_image():
+    if capture_image():
+        model = YOLO(model_path)
+        results = model.predict(image_path, imgsz=640, conf=0.4)
+
+        normal_count = 0
+        abnormal_count = 0
+
+        for result in results:
+            for box in result.boxes:
+                if box.cls == 1:  # Assuming class 1 is normal
+                    normal_count += 1
+                elif box.cls == 0:  # Assuming class 0 is abnormal
+                    abnormal_count += 1
+
+        # Save the annotated image
+        result_image = results[0].plot(show=False)
+        cv2.imwrite(annotated_image_path, result_image)
+
+        return normal_count, abnormal_count
+    else:
+        print("Image detection failed because no image was captured.")
+        return None
+
+# Function to read temperature and humidity from the DHT22 sensor
+def read_sensor(retries=5):
+    for _ in range(retries):
+        try:
+            temperature_c = dht_device.temperature
+            temperature_f = temperature_c * (9 / 5) + 32
+            humidity = dht_device.humidity
+            if temperature_c is not None and humidity is not None:
+                return temperature_c, temperature_f, humidity
+        except RuntimeError as err:
+            print(f"Sensor read error: {err}")
+        time.sleep(2.0)  # Wait 2 seconds before trying again
+    return None
+
+# Function to handle messages from Telegram
+def handle_message(msg):
+    chat_id = msg['chat']['id']
+    text = msg['text'].lower()
+
+    bot = telepot.Bot(TOKEN)
+
+    if text == 'halo':
+        response = 'Halo juga!'
+        bot.sendMessage(chat_id, response)
+    elif text == 'deteksi':
+        detection_results = detect_image()
+        if detection_results:
+            normal_count, abnormal_count = detection_results
+            response = (f'Deteksi gambar selesai.\n'
+                        f'Jumlah benih normal: {normal_count}\n'
+                        f'Jumlah benih abnormal: {abnormal_count}\n'
+                        f'Mengirim gambar...')
+            bot.sendMessage(chat_id, response)
+            # Send the annotated image to Telegram
+            with open(annotated_image_path, 'rb') as photo:
+                bot.sendPhoto(chat_id, photo)
+        else:
+            response = 'Gagal melakukan deteksi gambar.'
+            bot.sendMessage(chat_id, response)
+    elif text == 'suhu':
+        sensor_data = read_sensor()
+        if sensor_data:
+            temperature_c, temperature_f, humidity = sensor_data
+            response = (f"Suhu: {temperature_c:.1f} C / {temperature_f:.1f} F\n"
+                        f"Kelembaban: {humidity}%")
+            # Display temperature and humidity on LCD
+            lcd_string(f"Suhu: {temperature_c:.1f} C", LCD_LINE_1)
+            lcd_string(f"Kelembaban: {humidity}%", LCD_LINE_2)
+        else:
+            response = 'Gagal membaca data sensor.'
+        bot.sendMessage(chat_id, response)
+    elif text == 'pompa nyala':
+        with gpio_lock:
+            GPIO.output(relay_pompa, GPIO.LOW)  # Turn on the pump
+        response = 'Pompa air menyala selama 1 detik.'
+        lcd_string("Pompa air: ON", LCD_LINE_3)
+        bot.sendMessage(chat_id, response)
+        time.sleep(1)  # Wait for 1 second
+        with gpio_lock:
+            GPIO.output(relay_pompa, GPIO.HIGH)  # Turn off the pump
+        lcd_string("Pompa air: OFF", LCD_LINE_3)
+    elif text == 'pompa mati':
+        with gpio_lock:
+            GPIO.output(relay_pompa, GPIO.HIGH)  # Turn off the pump
+        response = 'Pompa air mati.'
+        lcd_string("Pompa air: OFF", LCD_LINE_3)
+        bot.sendMessage(chat_id, response)
+    elif text == 'lampu nyala':
+        with gpio_lock:
+            GPIO.output(relay_lampu, GPIO.LOW)  # Turn on the lamp
+        response = 'Lampu menyala.'
+        lcd_string("Lampu: ON", LCD_LINE_4)
+        bot.sendMessage(chat_id, response)
+    elif text == 'lampu mati':
+        with gpio_lock:
+            GPIO.output(relay_lampu, GPIO.HIGH)  # Turn off the lamp
+        response = 'Lampu mati.'
+        lcd_string("Lampu: OFF", LCD_LINE_4)
+        bot.sendMessage(chat_id, response)
+    elif text == 'help':
+        response = ('Perintah yang tersedia:\n'
+                    '1. halo - Menyapa bot.\n'
+                    '2. suhu - Membaca suhu dan kelembaban dari sensor.\n'
+                    '3. deteksi - Melakukan deteksi gambar dan mengirim hasilnya.\n'
+                    '4. pompa nyala - Menyalakan pompa air.\n'
+                    '5. pompa mati - Mematikan pompa air.\n'
+                    '6. lampu nyala - Menyalakan lampu.\n'
+                    '7. lampu mati - Mematikan lampu.\n'
+                    '8. help - Menampilkan bantuan dan daftar perintah.')
+        bot.sendMessage(chat_id, response)
+
+# Function to start the Telegram bot
+def start_bot():
+    bot = telepot.Bot(TOKEN)
+    bot.message_loop(handle_message)
+    print("Bot is running. Press Ctrl-C to stop.")
+    # Send startup message with command instructions
+    startup_message = ('Bot telah dijalankan. Berikut adalah perintah yang tersedia:\n'
+                       '1. halo - Menyapa bot.\n'
+                       '2. suhu - Membaca suhu dan kelembaban dari sensor.\n'
+                       '3. deteksi - Melakukan deteksi gambar dan mengirim hasilnya.\n'
+                       '4. pompa nyala - Menyalakan pompa air.\n'
+                       '5. pompa mati - Mematikan pompa air.\n'
+                       '6. lampu nyala - Menyalakan lampu.\n'
+                       '7. lampu mati - Mematikan lampu.\n'
+                       '8. help - Menampilkan bantuan dan daftar perintah.')
+    bot.sendMessage(CHAT_ID, startup_message)
+
+# Run the bot and image detection simultaneously
+if __name__ == "__main__":
+    try:
+        lcd_init()
+        Thread(target=start_bot).start()
+
+        # Loop to continuously read the DHT sensor (optional, if you need it outside Telegram requests)
+        while True:
+            sensor_data = read_sensor()
+            if sensor_data:
+                temperature_c, temperature_f, humidity = sensor_data
+                print(f"Temp: {temperature_c:.1f} C / {temperature_f:.1f} F    Humidity: {humidity}%")
+            time.sleep(2.0)
+    except KeyboardInterrupt:
+        print("Program interrupted.")
+    finally:
+        GPIO.cleanup()
+        lcd_byte(0x01, LCD_CMD)  # Clear display
+        print("GPIO cleanup done")
+
+
+
